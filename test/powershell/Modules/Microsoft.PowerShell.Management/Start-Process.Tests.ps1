@@ -33,28 +33,41 @@ Describe "Start-Process" -Tag "Feature","RequireAdminOnWindows" {
 
     It "Should handle stderr redirection without error" {
         $process = Start-Process $PWSH -ArgumentList $pwshParam -Wait -PassThru -RedirectStandardError $tempFile
-        Select-String -Path $tempFile -Pattern "stdout" | Should -BeNullOrEmpty
-        Select-String -Path $tempFile -Pattern "stderr" | Should -Not -BeNullOrEmpty
+
+        $redirectFile = Get-Content -Path $tempFile
+
+        $redirectFile | Select-String -Pattern "stdout" | Should -BeNullOrEmpty
+        $redirectFile | Select-String -Pattern "stderr" | Should -Not -BeNullOrEmpty
     }
 
     It "Should handle stdout redirection without error" {
         $process = Start-Process $PWSH -ArgumentList $pwshParam -Wait -PassThru -RedirectStandardError $tempFile
-        Select-String -Path $tempFile -Pattern "stdout" | Should -BeNullOrEmpty
-        Select-String -Path $tempFile -Pattern "stderr" | Should -Not -BeNullOrEmpty
+
+        $redirectFile = Get-Content -Path $tempFile
+
+        $redirectFile | Select-String -Pattern "stdout" | Should -BeNullOrEmpty
+        $redirectFile | Select-String -Pattern "stderr" | Should -Not -BeNullOrEmpty
     }
 
     It "Should handle stdout,stderr redirections without error" {
         $process = Start-Process $PWSH -ArgumentList $pwshParam -Wait -PassThru -RedirectStandardError $tempFile -RedirectStandardOutput "$TESTDRIVE/output"
-        Select-String -Path $tempFile -Pattern "stdout" | Should -BeNullOrEmpty
-        Select-String -Path $tempFile -Pattern "stderr" | Should -Not -BeNullOrEmpty
-        Select-String -Path "$TESTDRIVE/output" -Pattern "stdout" | Should -Not -BeNullOrEmpty
-        Select-String -Path "$TESTDRIVE/output" -Pattern "stderr" | Should -BeNullOrEmpty
+
+        $redirectStdoutFile = Get-Content -Path "$TESTDRIVE/output"
+        $redirectStderrFile = Get-Content -Path $tempFile
+
+        $redirectStderrFile | Select-String -Pattern "stdout" | Should -BeNullOrEmpty
+        $redirectStderrFile | Select-String -Pattern "stderr" | Should -Not -BeNullOrEmpty
+        $redirectStdoutFile | Select-String -Pattern "stdout" | Should -Not -BeNullOrEmpty
+        $redirectStdoutFile | Select-String -Pattern "stderr" | Should -BeNullOrEmpty
     }
 
     It "Should handle stdout,stderr redirections to the same file without error" {
         $process = Start-Process $PWSH -ArgumentList $pwshParam -Wait -PassThru -RedirectStandardError $tempFile -RedirectStandardOutput $tempFile
-        Select-String -Path $tempFile -Pattern "stdout" | Should -Not -BeNullOrEmpty
-        Select-String -Path $tempFile -Pattern "stderr" | Should -Not -BeNullOrEmpty
+
+        $redirectFile = Get-Content -Path $tempFile
+
+        $redirectFile | Select-String -Pattern "stdout" | Should -Not -BeNullOrEmpty
+        $redirectFile | Select-String -Pattern "stderr" | Should -Not -BeNullOrEmpty
     }
 
 }
