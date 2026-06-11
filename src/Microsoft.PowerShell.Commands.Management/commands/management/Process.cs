@@ -1849,6 +1849,9 @@ namespace Microsoft.PowerShell.Commands
 
         #endregion
 
+        private static readonly StringComparison PathComparison =
+            OperatingSystem.IsLinux() ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+
         #region overrides
 
         /// <summary>
@@ -2008,7 +2011,7 @@ namespace Microsoft.PowerShell.Commands
                 {
                     _redirectstandardinput = ResolveFilePath(_redirectstandardinput);
                     _redirectstandardoutput = ResolveFilePath(_redirectstandardoutput);
-                    if (_redirectstandardinput.Equals(_redirectstandardoutput, StringComparison.OrdinalIgnoreCase))
+                    if (_redirectstandardinput.Equals(_redirectstandardoutput, PathComparison))
                     {
                         message = StringUtil.Format(ProcessResources.DuplicateEntry, "RedirectStandardInput", "RedirectStandardOutput");
                         ErrorRecord er = new(new InvalidOperationException(message), "InvalidOperationException", ErrorCategory.InvalidOperation, null);
@@ -2022,7 +2025,7 @@ namespace Microsoft.PowerShell.Commands
                 {
                     _redirectstandardinput = ResolveFilePath(_redirectstandardinput);
                     _redirectstandarderror = ResolveFilePath(_redirectstandarderror);
-                    if (_redirectstandardinput.Equals(_redirectstandarderror, StringComparison.OrdinalIgnoreCase))
+                    if (_redirectstandardinput.Equals(_redirectstandarderror, PathComparison))
                     {
                         message = StringUtil.Format(ProcessResources.DuplicateEntry, "RedirectStandardInput", "RedirectStandardError");
                         ErrorRecord er = new(new InvalidOperationException(message), "InvalidOperationException", ErrorCategory.InvalidOperation, null);
@@ -2031,18 +2034,12 @@ namespace Microsoft.PowerShell.Commands
                     }
                 }
 
-                // RedirectionOutput == RedirectionError -> Throw Error
                 if (_redirectstandardoutput != null && _redirectstandarderror != null)
                 {
+                    // Resolve both paths up front: the same-file comparisons in
+                    // SetupInputOutputRedirection and SetStartupInfo operate on resolved paths.
                     _redirectstandarderror = ResolveFilePath(_redirectstandarderror);
                     _redirectstandardoutput = ResolveFilePath(_redirectstandardoutput);
-                    if (_redirectstandardoutput.Equals(_redirectstandarderror, StringComparison.OrdinalIgnoreCase))
-                    {
-                        message = StringUtil.Format(ProcessResources.DuplicateEntry, "RedirectStandardOutput", "RedirectStandardError");
-                        ErrorRecord er = new(new InvalidOperationException(message), "InvalidOperationException", ErrorCategory.InvalidOperation, null);
-                        WriteError(er);
-                        return;
-                    }
                 }
             }
             else if (ParameterSetName.Equals("UseShellExecute"))
@@ -2075,21 +2072,22 @@ namespace Microsoft.PowerShell.Commands
             {
 #if UNIX
                 process = new Process() { StartInfo = startInfo };
-                SetupInputOutputRedirection(process);
-                process.Start();
-                if (process.StartInfo.RedirectStandardOutput)
+                try
                 {
-                    process.BeginOutputReadLine();
+                    SetupInputOutputRedirection(process);
+                    process.Start();
                 }
-
-                if (process.StartInfo.RedirectStandardError)
+                finally
                 {
-                    process.BeginErrorReadLine();
-                }
-
-                if (process.StartInfo.RedirectStandardInput)
-                {
-                    WriteToStandardInput(process);
+                    // Release the parent's copies; the child got duplicates (or was never started).
+                    // Clear the StartInfo properties so a later Start() on a -PassThru object
+                    // does not see disposed handles.
+                    _inputHandle?.Dispose();
+                    _outputHandle?.Dispose();
+                    _errorHandle?.Dispose();
+                    startInfo.StandardInputHandle = null;
+                    startInfo.StandardOutputHandle = null;
+                    startInfo.StandardErrorHandle = null;
                 }
 #else
                 using ProcessInformation processInfo = StartWithCreateProcess(startInfo);
@@ -2237,119 +2235,79 @@ namespace Microsoft.PowerShell.Commands
         }
 
 #if UNIX
-        private StreamWriter _outputWriter;
-        private StreamWriter _errorWriter;
-
-        private void StdOutputHandler(object sendingProcess, DataReceivedEventArgs outLine)
-        {
-            if (!string.IsNullOrEmpty(outLine.Data))
-            {
-                _outputWriter.WriteLine(outLine.Data);
-                _outputWriter.Flush();
-            }
-        }
-
-        private void StdErrorHandler(object sendingProcess, DataReceivedEventArgs outLine)
-        {
-            if (!string.IsNullOrEmpty(outLine.Data))
-            {
-                _errorWriter.WriteLine(outLine.Data);
-                _errorWriter.Flush();
-            }
-        }
-
-        private void ExitHandler(object sendingProcess, System.EventArgs e)
-        {
-            // To avoid a race condition with Std*Handler, let's wait a bit before closing the streams
-            // System.Timer is not supported in CoreCLR, so let's spawn a new thread to do the wait
-
-            Thread delayedStreamClosing = new Thread(StreamClosing);
-            delayedStreamClosing.Start();
-        }
-
-        private void StreamClosing()
-        {
-            Thread.Sleep(1000);
-
-            _outputWriter?.Dispose();
-            _errorWriter?.Dispose();
-        }
+        // Handles passed to the child via StartInfo.Standard*Handle; kept in fields so the
+        // parent can release them after Start. Same-file: _errorHandle stays null, the shared
+        // _outputHandle is disposed once.
+        private SafeFileHandle _inputHandle;
+        private SafeFileHandle _outputHandle;
+        private SafeFileHandle _errorHandle;
 
         private void SetupInputOutputRedirection(Process p)
         {
             if (_redirectstandardinput != null)
             {
-                p.StartInfo.RedirectStandardInput = true;
-                _redirectstandardinput = ResolveFilePath(_redirectstandardinput);
-            }
-            else
-            {
-                p.StartInfo.RedirectStandardInput = false;
+                _inputHandle = GetSafeFileHandleForRedirection(
+                    ResolveFilePath(_redirectstandardinput),
+                    FileMode.Open, FileAccess.Read, FileShare.Read);
+                p.StartInfo.StandardInputHandle = _inputHandle;
             }
 
             if (_redirectstandardoutput != null)
             {
-                p.StartInfo.RedirectStandardOutput = true;
-                _redirectstandardoutput = ResolveFilePath(_redirectstandardoutput);
-                p.OutputDataReceived += new DataReceivedEventHandler(StdOutputHandler);
-
-                // Can't do StreamWriter(string) in coreCLR
-                _outputWriter = new StreamWriter(new FileStream(_redirectstandardoutput, FileMode.Create));
-            }
-            else
-            {
-                p.StartInfo.RedirectStandardOutput = false;
-                _outputWriter = null;
+                _outputHandle = GetSafeFileHandleForRedirection(
+                    ResolveFilePath(_redirectstandardoutput),
+                    FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+                p.StartInfo.StandardOutputHandle = _outputHandle;
             }
 
             if (_redirectstandarderror != null)
             {
-                p.StartInfo.RedirectStandardError = true;
-                _redirectstandarderror = ResolveFilePath(_redirectstandarderror);
-                p.ErrorDataReceived += new DataReceivedEventHandler(StdErrorHandler);
-
-                // Can't do StreamWriter(string) in coreCLR
-                _errorWriter = new StreamWriter(new FileStream(_redirectstandarderror, FileMode.Create));
+                // If stderr targets the same path as stdout, share the handle so the child
+                // gets one open-file description for both streams (kernel serializes writes).
+                if (_outputHandle != null
+                    && _redirectstandardoutput.Equals(_redirectstandarderror, PathComparison))
+                {
+                    p.StartInfo.StandardErrorHandle = _outputHandle;
+                }
+                else
+                {
+                    _errorHandle = GetSafeFileHandleForRedirection(
+                        ResolveFilePath(_redirectstandarderror),
+                        FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+                    p.StartInfo.StandardErrorHandle = _errorHandle;
+                }
             }
-            else
-            {
-                p.StartInfo.RedirectStandardError = false;
-                _errorWriter = null;
-            }
-
-            p.EnableRaisingEvents = true;
-            p.Exited += new EventHandler(ExitHandler);
         }
 
-        private void WriteToStandardInput(Process p)
+        private SafeFileHandle GetSafeFileHandleForRedirection(string redirectionPath, FileMode mode, FileAccess access, FileShare share)
         {
-            StreamWriter writer = p.StandardInput;
-            using (StreamReader reader = new StreamReader(new FileStream(_redirectstandardinput, FileMode.Open)))
+            try
             {
-                string line = reader.ReadToEnd();
-                writer.WriteLine(line);
+                return File.OpenHandle(redirectionPath, mode, access, share);
             }
-
-            writer.Dispose();
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                string message = StringUtil.Format(ProcessResources.InvalidStartProcess, ex.Message);
+                ErrorRecord er = new(new InvalidOperationException(message), "InvalidOperationException", ErrorCategory.InvalidOperation, null);
+                ThrowTerminatingError(er);
+                return null;
+            }
         }
 #else
 
         private SafeFileHandle GetSafeFileHandleForRedirection(string RedirectionPath, FileMode mode)
         {
-            SafeFileHandle sf = null;
             try
             {
-                sf = File.OpenHandle(RedirectionPath, mode, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Inheritable, FileOptions.WriteThrough);
+                return File.OpenHandle(RedirectionPath, mode, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Inheritable, FileOptions.WriteThrough);
             }
-            catch (Win32Exception win32ex)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                sf?.Dispose();
-                string message = StringUtil.Format(ProcessResources.InvalidStartProcess, win32ex.Message);
+                string message = StringUtil.Format(ProcessResources.InvalidStartProcess, ex.Message);
                 ErrorRecord er = new(new InvalidOperationException(message), "InvalidOperationException", ErrorCategory.InvalidOperation, null);
                 ThrowTerminatingError(er);
+                return null;
             }
-
-            return sf;
         }
 
         private static StringBuilder BuildCommandLine(string executableFileName, string arguments)
@@ -2450,7 +2408,16 @@ namespace Microsoft.PowerShell.Commands
             {
                 startinfo.RedirectStandardError = true;
                 _redirectstandarderror = ResolveFilePath(_redirectstandarderror);
-                lpStartupInfo.hStdError = GetSafeFileHandleForRedirection(_redirectstandarderror, FileMode.Create);
+                // If stderr targets the same path as stdout, reuse the stdout handle so the child
+                // gets one open-file description for both streams (kernel serializes writes).
+                if (_redirectstandardoutput is not null && _redirectstandarderror.Equals(_redirectstandardoutput, PathComparison))
+                {
+                    lpStartupInfo.hStdError = lpStartupInfo.hStdOutput;
+                }
+                else
+                {
+                    lpStartupInfo.hStdError = GetSafeFileHandleForRedirection(_redirectstandarderror, FileMode.Create);
+                }
             }
             else if (startinfo.CreateNoWindow)
             {
@@ -2925,6 +2892,8 @@ namespace Microsoft.PowerShell.Commands
                         this.hStdOutput = null;
                     }
 
+                    // When stdout and stderr were redirected to the same file, hStdError references
+                    // the same SafeFileHandle instance as hStdOutput; the second Dispose is a no-op.
                     if ((this.hStdError != null) && !this.hStdError.IsInvalid)
                     {
                         this.hStdError.Dispose();

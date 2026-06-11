@@ -18,6 +18,11 @@ Describe "Start-Process" -Tag "Feature","RequireAdminOnWindows" {
         $tempDirectory = Join-Path -Path $TestDrive -ChildPath 'PSPath[]'
         New-Item $tempDirectory -ItemType Directory  -Force
         $assetsFile = Join-Path -Path (Join-Path -Path $PSScriptRoot -ChildPath assets) -ChildPath SortTest.txt
+        $PWSH = (Get-Process -Id $PID).MainModule.FileName
+        $N = 50
+        $nl = [System.Environment]::NewLine
+        $writes = (1..$N | ForEach-Object { "[Console]::Out.WriteLine('stdout$_'); [Console]::Error.WriteLine('stderr$_')" }) -join '; '
+        $pwshParam = "-NoProfile -Command &{ $writes }"
         if ($IsWindows) {
             $pingParam = "-n 2 localhost"
         }
@@ -82,17 +87,89 @@ Describe "Start-Process" -Tag "Feature","RequireAdminOnWindows" {
     }
 
     It "Should handle stderr redirection without error" {
-        $process = Start-Process ping -ArgumentList $pingParam -PassThru -RedirectStandardError $tempFile -RedirectStandardOutput "$TESTDRIVE/output"  @extraArgs
-
-        $process.Length      | Should -Be 1
-        $process.Id          | Should -BeGreaterThan 1
-        # $process.ProcessName | Should -Be "ping"
+        $expectedStdout = 1..$N | ForEach-Object { "stdout$_" }
+        $expectedStderrText = ((1..$N | ForEach-Object { "stderr$_" }) -join $nl) + $nl
+        $output = & $PWSH -NoProfile -Command "&{ Start-Process `"$PWSH`" -ArgumentList `"$pwshParam`" -Wait -NoNewWindow -RedirectStandardError `"$tempFile`" }"
+        $output | Should -BeExactly $expectedStdout
+        Get-Content -Raw -Path $tempFile | Should -BeExactly $expectedStderrText
     }
 
     It "Should handle stdout redirection without error" {
-        $process = Start-Process ping -ArgumentList $pingParam -Wait -RedirectStandardOutput $tempFile  @extraArgs
-        $dirEntry = Get-ChildItem $tempFile
-        $dirEntry.Length | Should -BeGreaterThan 0
+        $expectedStderr = 1..$N | ForEach-Object { "stderr$_" }
+        $expectedStdoutText = ((1..$N | ForEach-Object { "stdout$_" }) -join $nl) + $nl
+        $output = & $PWSH -NoProfile -Command "&{ Start-Process `"$PWSH`" -ArgumentList `"$pwshParam`" -Wait -NoNewWindow -RedirectStandardOutput `"$tempFile`" }" 2>&1
+        $output | Should -BeExactly $expectedStderr
+        Get-Content -Raw -Path $tempFile | Should -BeExactly $expectedStdoutText
+    }
+
+    It "Should handle stdout,stderr redirections without error" {
+        $expectedStdoutText = ((1..$N | ForEach-Object { "stdout$_" }) -join $nl) + $nl
+        $expectedStderrText = ((1..$N | ForEach-Object { "stderr$_" }) -join $nl) + $nl
+        Start-Process $PWSH -ArgumentList $pwshParam -Wait -RedirectStandardError $tempFile -RedirectStandardOutput "$TESTDRIVE/output" @extraArgs
+        Get-Content -Raw -Path "$TESTDRIVE/output" | Should -BeExactly $expectedStdoutText
+        Get-Content -Raw -Path $tempFile | Should -BeExactly $expectedStderrText
+    }
+
+    It "Should preserve empty lines and lack of trailing newline in redirected output" {
+        $lf = [char]10
+        $arg = "-NoProfile -Command [Console]::Out.Write('a' + [char]10 + [char]10 + 'b')"
+        $outFile = Join-Path $TestDrive 'sp-raw.txt'
+        Start-Process $PWSH -ArgumentList $arg -Wait -RedirectStandardOutput $outFile -ErrorAction Stop @extraArgs
+        Get-Content -Raw -Path $outFile | Should -BeExactly "a${lf}${lf}b"
+    }
+
+    It "Should handle stdout,stderr redirections to the same file without error" {
+        $expectedSameFileText = ((1..$N | ForEach-Object { "stdout$_"; "stderr$_" }) -join $nl) + $nl
+        $sameFile = Join-Path $TestDrive 'sp-same.txt'
+        Start-Process $PWSH -ArgumentList $pwshParam -Wait -RedirectStandardError $sameFile -RedirectStandardOutput $sameFile -ErrorAction Stop @extraArgs
+        Get-Content -Raw -Path $sameFile | Should -BeExactly $expectedSameFileText
+    }
+
+    It "Should handle stdout,stderr redirections to the same file together with stdin and working directory" {
+        $stdinFile = Join-Path $TestDrive 'sp-input.txt'
+        $sameFile = Join-Path $TestDrive 'sp-same-stdin.txt'
+        Set-Content -Path $stdinFile -Value (1..$N | ForEach-Object { "$_" })
+        $workDir = $TestDrive
+        $childScript = "[Console]::Out.WriteLine('cwd:' + (Resolve-Path .).Path); " +
+                       "`$line = [Console]::In.ReadLine(); " +
+                       "while (`$line -ne `$null) { " +
+                       "[Console]::Out.WriteLine('stdout' + `$line); " +
+                       "[Console]::Error.WriteLine('stderr' + `$line); " +
+                       "`$line = [Console]::In.ReadLine() }"
+        $arg = "-NoProfile -Command &{ $childScript }"
+        Start-Process $PWSH -ArgumentList $arg -Wait `
+            -WorkingDirectory $workDir `
+            -RedirectStandardInput $stdinFile `
+            -RedirectStandardOutput $sameFile `
+            -RedirectStandardError $sameFile `
+            -ErrorAction Stop @extraArgs
+        $expectedCwd = (Resolve-Path $workDir).Path
+        if ($IsMacOS -and -not $expectedCwd.StartsWith('/private/')) {
+            # on macOS, TestDrive lives under $TMPDIR where /var is a symlink to /private/var;
+            # the child reports its physical working directory
+            $expectedCwd = "/private" + $expectedCwd
+        }
+        $expected = "cwd:$expectedCwd$nl" +
+            ((1..$N | ForEach-Object { "stdout$_"; "stderr$_" }) -join $nl) + $nl
+        Get-Content -Raw -Path $sameFile | Should -BeExactly $expected
+    }
+
+    It "Should treat stdout,stderr paths differing only by case as distinct files on Linux" -Skip:(!$IsLinux) {
+        $expectedStdoutText = ((1..$N | ForEach-Object { "stdout$_" }) -join $nl) + $nl
+        $expectedStderrText = ((1..$N | ForEach-Object { "stderr$_" }) -join $nl) + $nl
+        $stdoutFile = Join-Path $TestDrive 'sp-case.txt'
+        $stderrFile = Join-Path $TestDrive 'SP-CASE.TXT'
+        Start-Process $PWSH -ArgumentList $pwshParam -Wait -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+        Get-Content -Raw -Path $stdoutFile | Should -BeExactly $expectedStdoutText
+        Get-Content -Raw -Path $stderrFile | Should -BeExactly $expectedStderrText
+    }
+
+    It "Should treat stdout,stderr paths differing only by case as the same file on Windows and macOS" -Skip:$IsLinux {
+        $expectedSameFileText = ((1..$N | ForEach-Object { "stdout$_"; "stderr$_" }) -join $nl) + $nl
+        $stdoutFile = Join-Path $TestDrive 'sp-case.txt'
+        $stderrFile = Join-Path $TestDrive 'SP-CASE.TXT'
+        Start-Process $PWSH -ArgumentList $pwshParam -Wait -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -ErrorAction Stop @extraArgs
+        Get-Content -Raw -Path $stdoutFile | Should -BeExactly $expectedSameFileText
     }
 
     It "Should handle stdin redirection without error" {
